@@ -1,0 +1,45 @@
+conn.WriteMessage(messageType, p)
+messageType, p, err := conn.ReadMessage() => p is a []byte and messageType is an int with value websocket.BinaryMessage or websocket.TextMessage
+
+This above part is example of entire message buffering i.e to read the entire msg into the memory and same for the write
+
+------------------------------------------------------------------------------------------------------------------------------------------------
+An application can also send and receive messages using the io.WriteCloser and io.Reader interfaces:
+    messageType, r, err := conn.NextReader()
+    w, err := conn.NextWriter(messageType)
+
+This above is used to receive large chunks of messages (low level streaming).
+It streams the incoming messages and same for the writing messages.
+------------------------------------------------------------------------------------------------------------------------------------------------
+Control messages:
+The WebSocket protocol defines three types of control messages: close, ping and pong. Call the connection WriteControl, WriteMessage or 
+NextWriter methods to send a control message to the peer.
+
+The application must read the connection to process close, ping and pong messages sent from the peer
+------------------------------------------------------------------------------------------------------------------------------------------------
+Concurrency 
+Connections support one concurrent reader and one concurrent writer.
+
+Applications are responsible for ensuring that no more than one goroutine calls the write methods (NextWriter, SetWriteDeadline, WriteMessage
+WriteJSON, EnableWriteCompression, SetCompressionLevel) concurrently and that no more than one goroutine calls the read methods 
+(NextReader, SetReadDeadline, ReadMessage, ReadJSON, SetPongHandler, SetPingHandler) concurrently.
+------------------------------------------------------------------------------------------------------------------------------------------------
+Write buffers are also used for constructing WebSocket frames.A WebSocket frame header is written to the network each time a write buffer is
+flushed to the network.
+The buffer sizes in bytes are specified by the ReadBufferSize and WriteBufferSize fields in the Dialer and Upgrader.
+Default size by Dialer 4096 if a bufer size is set to 0
+Upgrader uses this buffer when a buffer size is set to 0
+Buffers exists for the lifetime of the connection by Default
+If WriteBufferPool field is set, then the connection holds the write buffer only when writing a message.\
+
+Hint: Limit the buffer sizes to the maximum expected message size.
+
+------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------
+Goroutine is killed when:
+Functions returns
+main() exists
+panic (unrecovered)
+program crash
+------------------------------------------------------------------------------------------------------------------------------------------------
