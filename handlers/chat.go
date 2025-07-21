@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"abc/chat"
+	rdc "abc/chat"
 	logger "abc/log"
 	"bytes"
 	"fmt"
@@ -31,7 +32,7 @@ func (p *poolAdapter) Put(buf any) {
 	p.pool.Put(buf)
 }
 
-var chatManager = chat.NewChatManager()
+var newhub = chat.NewHub()
 
 func SocketHandler(c echo.Context) error {
 	l := logger.Logger(c)
@@ -43,7 +44,9 @@ func SocketHandler(c echo.Context) error {
 		log.Println("Websocket could not be established as request upgrade failed:", err)
 		return err
 	}
+	rdbClient := rdc.NewRedisClient()
 
-	chatManager.HandleChat(l, ws, userID)
+	rdc.SubscribeAndDispatch(rdbClient, newhub)
+	newhub.HandleChat(l, ws, rdbClient, userID)
 	return nil
 }

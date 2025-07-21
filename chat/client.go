@@ -1,9 +1,13 @@
 package chat
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"sync"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -11,101 +15,168 @@ import (
 )
 
 type Client struct {
-	userID  string
-	conn    *websocket.Conn
-	manager *ChatManager
-	msgCH   chan Event
+	ID     string
+	Conn   *websocket.Conn
+	SendCh chan []byte
+	Hub    *Hub
+	RDB    *RedisClientWrapper
+	Logger *zap.Logger
 }
 
-func NewClient(userID string, conn *websocket.Conn, manager *ChatManager) *Client {
+type Hub struct {
+	ID      string
+	Clients map[string]*Client
+	Mutex   sync.RWMutex
+}
+
+// func NewClient(userID string, conn *websocket.Conn, manager *ChatManager) *Client {
+// 	return &Client{
+// 		ID:     userID,
+// 		Conn:   conn,
+// 		SendCh: make(chan []byte),
+// 	}
+// }
+
+func NewClient(userID string, conn *websocket.Conn, hub *Hub, rdb *RedisClientWrapper, logger *zap.Logger) *Client {
 	return &Client{
-		conn:    conn,
-		manager: manager,
-		userID:  userID,
-		msgCH:   make(chan Event),
+		ID:     userID,
+		Conn:   conn,
+		SendCh: make(chan []byte, 256),
+		Hub:    hub,
+		RDB:    rdb,
+		Logger: logger,
 	}
 }
 
-type ChatMessage struct {
-	ToUser  string `json:"to_user"`
-	Message string `json:"message"`
-}
-
-func (c *Client) readMessages(l *zap.Logger) {
+func (c *Client) readMessages() {
 	defer func() {
-		l.Info("Defering the read message function and un registering the client")
-		c.manager.UnregisterClient(c)
+		c.Logger.Info("Closing reader: unregistering client and closing connection")
+		UnregisterClient(c.Hub, c, c.RDB)
+		c.Conn.Close()
 	}()
+	c.Conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	c.Conn.SetPongHandler(func(string) error {
+		a := 10
+		c.Logger.Debug(zap.String(a))
+		c.Logger.Debug("Pong received, extending read deadline")
+		return c.Conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	})
 
 	for {
-		l.Info("Reader is listining ....")
-		_, r, err := c.conn.NextReader()
+		c.Conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		c.Logger.Info("Reader listening for messages...")
+		_, r, err := c.Conn.NextReader()
 		if err != nil {
-			l.Info("Error while connecting the reader")
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				l.Info(fmt.Sprintf("This is the socket error: %s", err))
-			} else {
-				l.Info(fmt.Sprintf("WebSocket closed: %v\n", err))
-			}
+			c.Logger.Warn("WebSocket  reader error", zap.Error(err))
 			break
 		}
+
 		message, err := io.ReadAll(r)
 		if err != nil {
-			l.Info(fmt.Sprintf("Error reading message: %v\n", err))
+			c.Logger.Error("Failed to read message body", zap.Error(err))
 			break
 		}
+
 		var chatMsg Event
-		err = json.Unmarshal(message, &chatMsg)
-		if err != nil {
-			fmt.Printf("Invalid message format: %v\n", err)
+		if err := json.Unmarshal(message, &chatMsg); err != nil {
+			c.Logger.Warn("Invalid message format", zap.ByteString("raw", message))
 			continue
 		}
-		l.Info("Routing the event to its handler")
-		if err := c.manager.routeEvent(chatMsg, c); err != nil {
-			l.Info("Error in routing the message")
-			return
+
+		c.Logger.Info("Received chat event", zap.Any("event", chatMsg))
+
+		if err := c.Hub.RouteEvent(chatMsg, c); err != nil {
+			c.Logger.Error("Failed to route event", zap.Error(err))
+			break
 		}
-		l.Info("Routing the event is success")
 	}
 }
 
-func (c *Client) writeMessage(l *zap.Logger) {
+func (c *Client) writeMessage() {
 	defer func() {
-		l.Info("Defering the write message function and un registering the client")
-		c.manager.UnregisterClient(c)
+		c.Logger.Info("Closing writer: unregistering client and closing connection")
+		UnregisterClient(c.Hub, c, c.RDB)
+		c.Conn.Close()
 	}()
 
 	for {
-		l.Info("Writer is listining ....")
 		select {
-		case msg, ok := <-c.msgCH:
-			l.Info("Fetching the event...")
+		case msg, ok := <-c.SendCh:
 			if !ok {
-				l.Info("Error in fetching the event from channel")
-				c.conn.WriteMessage(websocket.CloseMessage, nil)
-				return
-			}
-			l.Info("Event fetched successfully marshaling the event")
-			data, err := json.Marshal(msg)
-			l.Info(fmt.Sprintf("*** this is the data to be written back to the channel: %s", data))
-			if err != nil {
-				l.Info(fmt.Sprintf("error marshaling message: %s", err))
+				c.Logger.Warn("Send channel closed, sending WebSocket close message")
+				c.Conn.WriteMessage(websocket.CloseMessage, nil)
 				return
 			}
 
-			// targetConn, _ := c.manager.sockets[msg.ToUser]
-			l.Info("Preparing write to channel")
-			writer, err := c.conn.NextWriter(websocket.TextMessage)
+			writer, err := c.Conn.NextWriter(websocket.TextMessage)
 			if err != nil {
-				l.Info(fmt.Sprintf("Error in getting the writer: %s", err))
+				c.Logger.Error("Failed to get WebSocket writer", zap.Error(err))
+				return
 			}
-			l.Info("Writing the data back to channel")
-			if _, err := writer.Write(data); err != nil {
-				l.Info(fmt.Sprintf("error writing message:%s", err))
-				// writer.Close() // ensure writer is closed even on error
+
+			if _, err := writer.Write(msg); err != nil {
+				c.Logger.Error("Failed to write message to WebSocket", zap.Error(err))
+				writer.Close()
+				return
 			}
-			l.Info("Message sent back")
+
 			writer.Close()
+			c.Logger.Info("Message written to WebSocket", zap.ByteString("message", msg))
 		}
 	}
+}
+
+func (c *Client) RegisterClient(hub *Hub, rdb *RedisClientWrapper) {
+	hub.Mutex.Lock()
+	hub.Clients[c.ID] = c
+	hub.Mutex.Unlock()
+
+	err := rdb.Client.Set(context.Background(), c.ID, hub.ID, 0).Err()
+	if err != nil {
+		log.Println("Failed to register client in Redis:", err)
+	}
+}
+
+func UnregisterClient(hub *Hub, client *Client, rdb *RedisClientWrapper) {
+	hub.Mutex.Lock()
+	delete(hub.Clients, client.ID)
+	hub.Mutex.Unlock()
+
+	err := rdb.Client.Del(context.Background(), "user:"+client.ID).Err()
+	if err != nil {
+		log.Println("Failed to unregister client in Redis:", err)
+	}
+}
+
+func (h *Hub) RouteEvent(evt Event, from *Client) error {
+	if evt.Type == EventSendMessage {
+		toUser := evt.To
+		message := evt.Payload
+
+		// Check if recipient is connected locally (if present it will be found in hub)
+		h.Mutex.RLock()
+		target, ok := h.Clients[toUser]
+		h.Mutex.RUnlock()
+
+		if ok {
+			// Deliver locally
+			target.SendCh <- []byte(message)
+			return nil
+		}
+
+		// Recipient is connected to a different server → publish to Redis
+		payload := RPayload{
+			To:      toUser,
+			Message: message,
+		}
+		data, _ := json.Marshal(payload)
+		toServerId, err := from.RDB.Client.Get(ctx, evt.To).Result()
+		if err != nil {
+			log.Println("Error getting server ID from Redis:", err)
+			return err
+		}
+		return from.RDB.Client.Publish(ctx, toServerId, data).Err()
+	}
+
+	return fmt.Errorf("unknown event type: %s", evt.Type)
 }
